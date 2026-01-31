@@ -1,0 +1,22 @@
+# --------------------------------------------------------------
+# FastAPI – the async web framework (includes Starlette, pydantic, etc.)
+# --------------------------------------------------------------
+fastapi>=0.112.0
+
+# --------------------------------------------------------------
+# Uvicorn – high‑performance ASGI server (the [standard] extra brings
+# optional speed‑ups like uvloop, httptools, websockets, etc.)
+# --------------------------------------------------------------
+uvicorn[standard]>=0.30.0
+
+# --------------------------------------------------------------
+# aiofiles – async file I/O used for chunked upload / download
+# --------------------------------------------------------------
+aiofiles>=24.1.0
+
+# --------------------------------------------------------------
+# python-multipart – FastAPI’s dependency for handling multipart/form‑data
+# (file uploads). Pinning explicitly avoids surprises if the transitive
+# dependency ever changes.
+# --------------------------------------------------------------
+python-multipart>=0.0.9
