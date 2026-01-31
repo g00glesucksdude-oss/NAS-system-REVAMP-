@@ -8,29 +8,37 @@ from pathlib import Path
 GREEN = "\033[92m"
 RESET = "\033[0m"
 
-# Global speed multiplier
-speed_factor = 1.0
+# Flag to skip current line instantly
+skip_line = False
 
 def key_listener():
-    """Listen for random keypresses to speed up animation."""
-    global speed_factor
+    """Listen for keypresses to instantly finish current line."""
+    global skip_line
     while True:
         if msvcrt.kbhit():
             msvcrt.getch()  # consume the key
-            speed_factor = max(0.1, speed_factor * 0.7)  # speed up typing
+            skip_line = True
 
 def type_out_file(filepath):
-    """Print file contents character by character in green."""
+    """Print file contents line by line with typing effect."""
+    global skip_line
     if not Path(filepath).exists():
         print(f"{filepath} not found, skipping...")
         return
     with open(filepath, "r", encoding="utf-8") as f:
         for line in f:
+            skip_line = False
             for char in line:
+                if skip_line:
+                    # Instantly finish the rest of the line
+                    sys.stdout.write(GREEN + line[line.index(char):] + RESET)
+                    sys.stdout.flush()
+                    break
                 sys.stdout.write(GREEN + char + RESET)
                 sys.stdout.flush()
-                time.sleep(0.002 * speed_factor)
-            time.sleep(0.05 * speed_factor)
+                time.sleep(0.002)
+            print()  # newline after each line
+            time.sleep(0.05)
 
 def loading_animation():
     print(GREEN + "=== Reading server.py ===" + RESET)
