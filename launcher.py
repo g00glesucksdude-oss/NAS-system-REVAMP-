@@ -8,41 +8,41 @@ from pathlib import Path
 GREEN = "\033[92m"
 RESET = "\033[0m"
 
-# Flag to skip typing and instantly finish line
-skip_now = False
+# Flag to instantly finish current file
+instant_dump = False
 
 def key_listener():
-    """Listen for keypresses to instantly finish current line."""
-    global skip_now
+    """Listen for keypresses to instantly dump the rest of the file."""
+    global instant_dump
     while True:
         if msvcrt.kbhit():
             msvcrt.getch()  # consume the key
-            skip_now = True
+            instant_dump = True
 
 def type_out_file(filepath):
-    """Print file contents line by line with typing effect."""
-    global skip_now
+    """Print file contents with typing effect unless interrupted."""
+    global instant_dump
     if not Path(filepath).exists():
         print(f"{filepath} not found, skipping...")
         return
     with open(filepath, "r", encoding="utf-8") as f:
-        for line in f:
-            skip_now = False
-            start_time = time.time()
-            for i, char in enumerate(line):
-                if skip_now:
-                    # Instantly finish the line but still take ~2 seconds total
-                    sys.stdout.write(GREEN + line[i:] + RESET)
+        content = f.read()
+        if not instant_dump:
+            # Normal slow typing until a key is pressed
+            for char in content:
+                if instant_dump:
+                    # Instantly dump the rest of the file
+                    sys.stdout.write(GREEN + content[content.index(char):] + RESET)
                     sys.stdout.flush()
-                    # Wait until 2 seconds have passed since line started
-                    while time.time() - start_time < 2.0:
-                        time.sleep(0.01)
                     break
                 sys.stdout.write(GREEN + char + RESET)
                 sys.stdout.flush()
                 time.sleep(0.002)
-            print()  # newline after each line
-            time.sleep(0.05)
+        else:
+            # If key pressed, dump everything at once
+            sys.stdout.write(GREEN + content + RESET)
+            sys.stdout.flush()
+    print("\n")
 
 def loading_animation():
     print(GREEN + "=== Reading server.py ===" + RESET)
