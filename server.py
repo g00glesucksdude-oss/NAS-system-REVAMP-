@@ -2,16 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-FastAPI “origin + tracker + chat hub” – READ‑ONLY BUG FIXED
+FastAPI “origin + tracker + chat hub” – BROWSE FIX + LEGACY DOWNLOAD
 
-Only one line changed:
-    the DELETE endpoint now checks READONLY_ROOMS and returns 403
-    when the room is read‑only.
-
-All other features (password lock‑out, token auth, P2P signalling,
-real‑folder streaming, upload cancellation, etc.) are unchanged.
+All UI (HTML + JS) lives in ./static/ and is served as static files.
 """
 
+# ----------------------------------------------------------------------
+# IMPORTS
+# ----------------------------------------------------------------------
 import os
 import json
 import shutil
@@ -36,7 +34,6 @@ from fastapi import (
     Request,
 )
 from fastapi.responses import (
-    HTMLResponse,
     FileResponse,
     StreamingResponse,
 )
@@ -51,34 +48,29 @@ BASE_DIR = Path(__file__).parent.resolve()
 UPLOAD_ROOT = BASE_DIR / "uploads"                # archive files per room
 UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
 
-PERSIST_FILE = BASE_DIR / "persist.json"           # drives + passwords + readonly
+PERSIST_FILE = BASE_DIR / "persist.json"         # drives + passwords + readonly + settings
 
-MAX_PWD_ATTEMPTS = 5                            # lock‑out after N bad attempts
-LOCKOUT_SECONDS = 300                           # lock‑out time (5 min)
+MAX_PWD_ATTEMPTS = 5                             # lock‑out after N bad attempts
+LOCKOUT_SECONDS = 300                            # lock‑out time (5 min)
+
+# Legacy download settings (configurable at runtime – default = 2 users)
+MAX_LEGACY_USERS = 2
+legacy_download_users: Set[str] = set()           # active legacy download client IPs
 
 # ----------------------------------------------------------------------
 # GLOBAL STATE
 # ----------------------------------------------------------------------
-chat_rooms:   Dict[str, List[WebSocket]] = {}                # room → all chat sockets
-chat_auth:    Dict[str, Set[WebSocket]] = {}                 # room → authenticated chat sockets
-signal_rooms: Dict[str, Dict[str, WebSocket]] = {}          # room → {peer_id: WS}
+chat_rooms:   Dict[str, List[WebSocket]] = {}               # room → all chat sockets
+chat_auth:    Dict[str, Set[WebSocket]] = {}                # room → authenticated chat sockets
+signal_rooms: Dict[str, Dict[str, WebSocket]] = {}           # room → {peer_id: WS}
 update_rooms: Dict[str, List[WebSocket]] = {}                # room → update WS list
 uploads_state: Dict[str, dict] = {}                          # "room/filename" → temp state
 
-# drives: mount_name → {"path":Path,"display":str}
-DRIVE_INFO: Dict[str, dict] = {}
-
-# In‑memory cache – kept only for the REPL, auth checks read the file directly
-ROOM_PASSWORDS: Dict[str, str] = {}
-
-# read‑only rooms (persisted)
-READONLY_ROOMS: Set[str] = set()
-
-# short‑lived auth tokens (issued after a correct password)
-auth_tokens: Dict[str, dict] = {}      # token → {"room": str, "expires": ts}
-
-# lock‑out counters
-pwd_attempts: Dict[str, Dict[str, dict]] = {}   # room → ip → {count, locked_until}
+DRIVE_INFO: Dict[str, dict] = {}                              # mount_name → {"path":Path,"display":str}
+ROOM_PASSWORDS: Dict[str, str] = {}                           # room → password (read from file each request)
+READONLY_ROOMS: Set[str] = set()                             # immutable rooms
+auth_tokens: Dict[str, dict] = {}                               # token → {"room":str,"expires":ts}
+pwd_attempts: Dict[str, Dict[str, dict]] = {}               # room → ip → {count, locked_until}
 
 # ----------------------------------------------------------------------
 # HELPERS – persistence
@@ -113,7 +105,7 @@ def _sanitize_mount_name(name: str) -> str:
 
 
 def _load_passwords_from_file() -> Dict[str, str]:
-    """Read the *password* section from persist.json (on‑demand)."""
+    """Read only the passwords section from persist.json (fresh each call)."""
     if not PERSIST_FILE.is_file():
         return {}
     try:
@@ -125,8 +117,8 @@ def _load_passwords_from_file() -> Dict[str, str]:
 
 
 def load_state():
-    """Load drives, passwords and readonly flags from persist.json."""
-    global DRIVE_INFO, ROOM_PASSWORDS, READONLY_ROOMS
+    """Load drives, passwords, readonly flags and settings from persist.json."""
+    global DRIVE_INFO, ROOM_PASSWORDS, READONLY_ROOMS, MAX_LEGACY_USERS
     if not PERSIST_FILE.is_file():
         print("[i] No persisted state – starting fresh")
         return
@@ -134,32 +126,34 @@ def load_state():
         with PERSIST_FILE.open("r", encoding="utf-8") as f:
             data = json.load(f)
 
-        # ----- drives -----
+        # ---- drives -------------------------------------------------
         for name, info in data.get("drives", {}).items():
             path = Path(info["path"])
             if path.is_dir():
                 DRIVE_INFO[name] = {"path": path, "display": info.get("display", name)}
-                app.mount(f"/{name}", StaticFiles(directory=path), name=name)
-
-        # ----- passwords -----
+                # The actual mount will be added after the FastAPI app is created
+        # ---- passwords ----------------------------------------------
         ROOM_PASSWORDS = data.get("passwords", {})
-
-        # ----- readonly -----
+        # ---- readonly -----------------------------------------------
         READONLY_ROOMS = set(data.get("readonly_rooms", []))
+        # ---- settings -----------------------------------------------
+        settings = data.get("settings", {})
+        MAX_LEGACY_USERS = settings.get("max_legacy_users", 2)   # default 2
         print("[i] Persisted state loaded.")
     except Exception as exc:
         print(f"[!] Failed to load persisted state: {exc}")
 
 
 def save_state():
-    """Write the current drives, passwords and readonly flags back to persist.json."""
+    """Write the current drives, passwords, readonly flags and settings back to persist.json."""
     data = {
         "drives": {
-            name: {"path": str(info["path"]), "display": info["display"]}
-            for name, info in DRIVE_INFO.items()
+            n: {"path": str(info["path"]), "display": info["display"]}
+            for n, info in DRIVE_INFO.items()
         },
         "passwords": ROOM_PASSWORDS,
         "readonly_rooms": list(READONLY_ROOMS),
+        "settings": {"max_legacy_users": MAX_LEGACY_USERS},
     }
     try:
         with PERSIST_FILE.open("w", encoding="utf-8") as f:
@@ -193,8 +187,10 @@ def remove_drive(name: str):
     if name not in DRIVE_INFO:
         print(f"[!] No such drive {name}")
         return
+    # Remove routes that start with this mount
     app.router.routes = [
-        r for r in app.router.routes if not (hasattr(r, "path") and r.path.startswith(f"/{name}"))
+        r for r in app.router.routes
+        if not (hasattr(r, "path") and r.path.startswith(f"/{name}"))
     ]
     DRIVE_INFO.pop(name)
     print(f"[-] Unmounted drive {name}")
@@ -202,18 +198,19 @@ def remove_drive(name: str):
 
 
 # ----------------------------------------------------------------------
-# REPL – tiny console (runs in a daemon thread)
+# REPL – tiny admin console (runs in a daemon thread)
 # ----------------------------------------------------------------------
 def console_thread():
     help_msg = """
 Commands (type the word and press ENTER):
   adddrive <path>           – mount an external folder (quotes allowed)
-  rmdrive <mount_name>     – unmount a previously added drive
-  listdrives               – show currently mounted drives
-  setpwd <room> <pwd>      – protect a room with a password (pwd may contain spaces)
-  rempwd <room>            – remove password protection from a room
-  setreadonly <room>       – mark a room read‑only (uploads & deletions blocked)
-  unsetreadonly <room>     – remove read‑only flag
+  rmdrive <mount_name>      – unmount a previously added drive
+  listdrives                – show currently mounted drives
+  setpwd <room> <pwd>       – protect a room with a password (pwd may contain spaces)
+  rempwd <room>             – remove password protection from a room
+  setreadonly <room>        – mark a room read‑only (uploads & deletions blocked)
+  unsetreadonly <room>      – remove read‑only flag
+  setlegacylimit <num>      – set max concurrent legacy downloads (default: 2)
   reload                    – reload persisted state from persist.json
   exit / quit               – stop the server
 """
@@ -232,6 +229,7 @@ Commands (type the word and press ENTER):
             continue
         cmd = parts[0].lower()
 
+        # ----- drive handling -----------------------------------------
         if cmd == "adddrive" and len(parts) >= 2:
             add_drive(Path(" ".join(parts[1:])).expanduser().resolve())
             continue
@@ -248,37 +246,55 @@ Commands (type the word and press ENTER):
                 print("[i] No drives mounted.")
             continue
 
+        # ----- password handling ---------------------------------------
         if cmd == "setpwd" and len(parts) >= 3:
             room = parts[1]
             pwd = " ".join(parts[2:])
             ROOM_PASSWORDS[room] = pwd
             save_state()
-            print(f"[i] Password set for room “{room}”.")
+            print(f'[i] Password set for room "{room}".')
             continue
 
         if cmd == "rempwd" and len(parts) == 2:
             ROOM_PASSWORDS.pop(parts[1], None)
             save_state()
-            print(f"[i] Password removed for room “{parts[1]}”.")
+            print(f'[i] Password removed for room "{parts[1]}".')
             continue
 
+        # ----- read‑only handling --------------------------------------
         if cmd == "setreadonly" and len(parts) == 2:
             READONLY_ROOMS.add(parts[1])
             save_state()
-            print(f"[i] Room “{parts[1]}” set to read‑only.")
+            print(f'[i] Room "{parts[1]}" set to read‑only.')
             continue
 
         if cmd == "unsetreadonly" and len(parts) == 2:
             READONLY_ROOMS.discard(parts[1])
             save_state()
-            print(f"[i] Read‑only flag removed from room “{parts[1]}”.")
+            print(f'[i] Read‑only flag removed from room "{parts[1]}".')
             continue
 
+        # ----- legacy‑download limit ----------------------------------
+        if cmd == "setlegacylimit" and len(parts) == 2:
+            try:
+                global MAX_LEGACY_USERS
+                MAX_LEGACY_USERS = int(parts[1])
+                save_state()
+                print(f"[i] Max legacy download users set to {MAX_LEGACY_USERS}")
+            except ValueError:
+                print("[!] Invalid number")
+            continue
+
+        # ----- reload persisted state ----------------------------------
         if cmd == "reload":
             load_state()
+            # Re‑mount any persisted drives (they are stored in DRIVE_INFO)
+            for name, info in DRIVE_INFO.items():
+                app.mount(f"/{name}", StaticFiles(directory=info["path"]), name=name)
             print("[i] State reloaded from persist.json")
             continue
 
+        # ----- exit ----------------------------------------------------
         if cmd in ("exit", "quit"):
             print("[i] Shutting down …")
             os._exit(0)
@@ -299,10 +315,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load persisted state before anything else
+# ----------------------------------------------------------------------
+# Load persisted state BEFORE mounting any drives
+# ----------------------------------------------------------------------
 load_state()
 
+# After loading, actually mount the drives
+for name, info in DRIVE_INFO.items():
+    app.mount(f"/{name}", StaticFiles(directory=info["path"]), name=name)
+
+# ----------------------------------------------------------------------
 # Mount any drives supplied via the environment variable at start‑up
+# ----------------------------------------------------------------------
 env_drives = [
     Path(p).expanduser().resolve()
     for p in os.getenv("STREAM_DRIVES", "").split(os.pathsep)
@@ -311,7 +335,6 @@ env_drives = [
 for p in env_drives:
     add_drive(p)
 
-
 # ----------------------------------------------------------------------
 # 0️⃣ Health‑check (used by the UI)
 # ----------------------------------------------------------------------
@@ -319,9 +342,8 @@ for p in env_drives:
 async def health() -> dict:
     return {"status": "ok"}
 
-
 # ----------------------------------------------------------------------
-# Helper – does the room need a password? (reads file every call)
+# Helper – does the room need a password? (reads file each call)
 # ----------------------------------------------------------------------
 @app.get("/room_password")
 async def room_password(room: str):
@@ -337,7 +359,6 @@ async def room_info(room: str):
         "readonly": room in READONLY_ROOMS,
     }
 
-
 # ----------------------------------------------------------------------
 # Verify password (used by UI modal)
 # ----------------------------------------------------------------------
@@ -348,7 +369,6 @@ async def verify_password(room: str, pwd: str):
     if required is None:
         return {"valid": True}
     return {"valid": required == pwd}
-
 
 # ----------------------------------------------------------------------
 # Password handling helpers (lock‑out, attempts)
@@ -373,12 +393,12 @@ def check_password(room: str, pwd: str | None, client_ip: str):
     passwords = _load_passwords_from_file()
     required = passwords.get(room)
 
-    # No password required → success
+    # No password needed → success
     if required is None:
         _track_attempt(room, client_ip, True)
         return
 
-    # Password required – verify lock‑out first
+    # Password required – first check lock‑out
     attempts = pwd_attempts.setdefault(room, {}).setdefault(
         client_ip, {"count": 0, "locked_until": 0}
     )
@@ -445,7 +465,7 @@ async def upload_chunk(
 
     # ---- read‑only guard ----
     if room in READONLY_ROOMS:
-        raise HTTPException(status_code=403, detail="Room is read-only")
+        raise HTTPException(status_code=403, detail="Room is read‑only")
 
     if not (0 <= chunk_index < total_chunks):
         raise HTTPException(status_code=400, detail="Invalid chunk_index")
@@ -458,12 +478,12 @@ async def upload_chunk(
     if checksum and checksum != sha256_bytes(data):
         raise HTTPException(status_code=400, detail="Checksum mismatch")
 
-    # store chunk on disk
+    # Store the chunk on disk
     chunk_path = tmp_dir / f"chunk_{chunk_index}"
     async with aiofiles.open(chunk_path, "wb") as out:
         await out.write(data)
 
-    # update temporary in‑memory state
+    # Update in‑memory state
     key = f"{room}/{filename}"
     state = uploads_state.get(key)
     if not state:
@@ -497,14 +517,24 @@ async def upload_chunk(
             "total_chunks": total_chunks,
             "chunk_hashes": state["hashes"],
         }
-        async with aiofiles.open(meta_path(final_path), "w") as f:
-            await f.write(json.dumps(meta))
+
+        # Write meta only if it changed (or does not exist)
+        meta_file_path = meta_path(final_path)
+        write_meta = True
+        if meta_file_path.is_file():
+            async with aiofiles.open(meta_file_path, "r") as f:
+                existing = json.loads(await f.read())
+            if existing.get("size") == meta["size"]:
+                write_meta = False   # unchanged → skip
+        if write_meta:
+            async with aiofiles.open(meta_file_path, "w") as f:
+                await f.write(json.dumps(meta))
 
         # clean‑up temp folder + in‑memory record
         shutil.rmtree(tmp_dir, ignore_errors=True)
         uploads_state.pop(key, None)
 
-        # notify UI that the file list changed
+        # Notify UI that the file list changed
         await notify_update(room)
 
     return {"status": "ok", "chunk_index": chunk_index}
@@ -543,6 +573,7 @@ async def file_info(
 
 @app.get("/streams/file_info")
 async def streams_file_info(path: str, drive: str = None):
+    """Return size‑information for a file inside a mounted drive."""
     if not DRIVE_INFO:
         raise HTTPException(status_code=404, detail="No drives mounted")
     if drive is None:
@@ -559,7 +590,7 @@ async def streams_file_info(path: str, drive: str = None):
         "size": size,
         "chunk_size": CHUNK_SIZE,
         "total_chunks": total,
-        "chunk_hashes": [],
+        "chunk_hashes": [],            # streams never store per‑chunk hashes on‑disk
     }
 
 
@@ -600,7 +631,7 @@ async def download_chunk(
 
 
 # ----------------------------------------------------------------------
-# 4️⃣ Full‑file fallback (GET /download)
+# 4️⃣ Full‑file fallback (GET /download) – archive mode
 # ----------------------------------------------------------------------
 @app.get("/download")
 async def download_full(
@@ -610,6 +641,7 @@ async def download_full(
     auth_token: str | None = None,
     request: Request = None,
 ):
+    """Return the entire file (no chunking)."""
     auth_or_pwd(room, pwd, auth_token, request)
     file_path = UPLOAD_ROOT / room / filename
     if not file_path.is_file():
@@ -651,9 +683,9 @@ async def delete_file(
 ):
     auth_or_pwd(room, pwd, auth_token, request)
 
-    # ---------- NEW: read‑only guard ----------
+    # ---------- read‑only guard ----------
     if room in READONLY_ROOMS:
-        raise HTTPException(status_code=403, detail="Room is read-only")
+        raise HTTPException(status_code=403, detail="Room is read‑only")
 
     file_path = UPLOAD_ROOT / room / filename
     if not file_path.is_file():
@@ -671,7 +703,7 @@ async def delete_file(
 # ----------------------------------------------------------------------
 @app.get("/streams/drives")
 async def list_drives():
-    """Return a JSON list of the mounted drives (display name + mount name + availability)."""
+    """Return a JSON list of the mounted drives."""
     return {
         "drives": [
             {
@@ -685,9 +717,9 @@ async def list_drives():
     }
 
 
-# Legacy flat‑list (kept for backward compatibility)
 @app.get("/streams/list")
 async def streams_list(drive: str = None):
+    """Legacy flat list of all files in a drive (kept for backward compatibility)."""
     if not DRIVE_INFO:
         raise HTTPException(status_code=404, detail="No drives mounted")
     if drive is None:
@@ -698,28 +730,24 @@ async def streams_list(drive: str = None):
     files = []
     for root, _, fnames in os.walk(base):
         for fn in fnames:
-            full = Path(root) / fn
-            rel = full.relative_to(base).as_posix()
             if fn.endswith(".meta.json"):
                 continue
-            files.append(
-                {"name": fn, "path": rel, "size": full.stat().st_size}
-            )
+            full = Path(root) / fn
+            rel = full.relative_to(base).as_posix()
+            files.append({"name": fn, "path": rel, "size": full.stat().st_size})
     return {"drive": drive, "files": files}
 
 
-# NEW endpoint – real folder hierarchy (used by the UI)
+# ----------------------------------------------------------------------
+# 7️⃣ Browse – **fixed**: respects the folder you request
+# ----------------------------------------------------------------------
 @app.get("/streams/browse")
 async def streams_browse(drive: str, dir_path: str = ""):
     """
     Return the contents of a directory inside the chosen drive.
-    Response:
-    {
-        "drive": "<mount>",
-        "current": "<relative_path_without_leading_slash>",   # empty string = root
-        "folders": ["sub1","sub2",...],
-        "files": [{"name":"file.mp4","size":12345,"path":"sub1/file.mp4"}, ...]
-    }
+
+    The endpoint accepts both the historic ``path=`` query‑parameter
+    and the newer ``dir_path=`` parameter (the UI may use either).
     """
     if not DRIVE_INFO:
         raise HTTPException(status_code=404, detail="No drives mounted")
@@ -727,8 +755,17 @@ async def streams_browse(drive: str, dir_path: str = ""):
         raise HTTPException(status_code=404, detail="Drive not found")
 
     base = DRIVE_INFO[drive]["path"]
-    clean = dir_path.strip("/")                 # normalise
+
+    # Normalise the incoming path – strip leading/trailing slashes
+    clean = dir_path.strip("/").replace("\\", "/")
     target = base / clean if clean else base
+
+    # Security – never allow escaping the mounted drive
+    try:
+        target = target.resolve()
+        target.relative_to(base.resolve())
+    except (ValueError, RuntimeError):
+        raise HTTPException(status_code=403, detail="Access denied: path outside drive")
 
     if not target.exists():
         raise HTTPException(status_code=404, detail="Directory not found")
@@ -743,20 +780,63 @@ async def streams_browse(drive: str, dir_path: str = ""):
             folders.append(entry.name)
         elif entry.is_file() and not entry.name.endswith(".meta.json"):
             rel = entry.relative_to(base).as_posix()
-            files.append(
-                {"name": entry.name, "size": entry.stat().st_size, "path": rel}
-            )
+            files.append({"name": entry.name, "size": entry.stat().st_size, "path": rel})
 
     return {
         "drive": drive,
-        "current": clean,
+        "current": clean,                 # empty string = root
         "folders": sorted(folders),
         "files": sorted(files, key=lambda f: f["name"]),
     }
 
 
+# ----------------------------------------------------------------------
+# 8️⃣ Legacy whole‑file download (concurrent‑user limit)
+# ----------------------------------------------------------------------
+@app.get("/streams/data_legacy")
+async def streams_data_legacy(
+    path: str,
+    drive: str = None,
+    request: Request = None,
+):
+    """
+    Legacy whole‑file download.
+    Limited to ``MAX_LEGACY_USERS`` concurrent downloads (default: 2).
+    """
+    if not DRIVE_INFO:
+        raise HTTPException(status_code=404, detail="No drives mounted")
+    if drive is None:
+        drive = next(iter(DRIVE_INFO))
+    if drive not in DRIVE_INFO:
+        raise HTTPException(status_code=404, detail="Drive not found")
+
+    client_ip = request.client.host if request else "unknown"
+
+    # Enforce the limit
+    if len(legacy_download_users) >= MAX_LEGACY_USERS and client_ip not in legacy_download_users:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Legacy download limit reached ({MAX_LEGACY_USERS} users). Try chunked download or wait.",
+        )
+
+    file_path = DRIVE_INFO[drive]["path"] / path
+    if not file_path.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    # Register the client while the response streams
+    legacy_download_users.add(client_ip)
+    try:
+        return FileResponse(file_path)
+    finally:
+        legacy_download_users.discard(client_ip)
+
+
+# ----------------------------------------------------------------------
+# 9️⃣ Chunked download for streams (default method)
+# ----------------------------------------------------------------------
 @app.get("/streams/data")
 async def streams_data(path: str, drive: str = None, chunk_id: int = None):
+    """Chunked download for streams (default method)."""
     if not DRIVE_INFO:
         raise HTTPException(status_code=404, detail="No drives mounted")
     if drive is None:
@@ -792,25 +872,37 @@ async def streams_data(path: str, drive: str = None, chunk_id: int = None):
 
 
 # ----------------------------------------------------------------------
-# 7️⃣ Chat websocket – timestamps, broadcast to every client (incl. sender)
+# 10️⃣ Settings endpoint (exposes server limits)
+# ----------------------------------------------------------------------
+@app.get("/settings")
+async def get_settings():
+    """Return a small JSON object that the UI can show."""
+    return {
+        "max_legacy_users": MAX_LEGACY_USERS,
+        "current_legacy_users": len(legacy_download_users),
+    }
+
+
+# ----------------------------------------------------------------------
+# 11️⃣ Chat websocket – timestamps, broadcast to every client (incl. sender)
 # ----------------------------------------------------------------------
 @app.websocket("/ws/chat/{room}")
 async def chat_ws(websocket: WebSocket, room: str):
     """
-    *If a valid auth token is supplied via the query string* → the socket is
-    automatically authenticated (no password prompt).
-    *If the room has a password* → normal flow (type “pass:…”, receive token).
+    *If a valid auth token is supplied via the query string* → socket
+    is automatically authenticated (no password prompt).
+    *If the room has a password* → client must type ``pass:YOUR_PASSWORD``.
     *If the room is public* → socket is authenticated immediately.
     """
     client_ip = websocket.client.host
     await websocket.accept()
 
-    # Register the socket (all sockets)
+    # Register sockets (all + authenticated subset)
     chat_rooms.setdefault(room, []).append(websocket)
     chat_auth.setdefault(room, set())
 
     # ---------------------------------------------------------------
-    # 1️⃣ Try token authentication (query‑param auth_token)
+    # 1️⃣ Token authentication (query param)
     # ---------------------------------------------------------------
     token = websocket.query_params.get("auth_token")
     password_required = None
@@ -823,7 +915,7 @@ async def chat_ws(websocket: WebSocket, room: str):
             password_required = False
         else:
             await websocket.send_text(
-                "SYSTEM: Invalid/expired token – please type pass:YOUR_PASSWORD to unlock this room."
+                "SYSTEM: Invalid/expired token – please type pass:YOUR_PASSWORD"
             )
             passwords = _load_passwords_from_file()
             password_required = room in passwords
@@ -848,7 +940,7 @@ async def chat_ws(websocket: WebSocket, room: str):
             raw = await websocket.receive_text()
 
             # ---------------------------------------------------------------
-            # 1️⃣ Private‑room password handling (unchanged)
+            # 1️⃣ Private‑room password handling
             # ---------------------------------------------------------------
             if password_required and raw.lower().startswith("pass:"):
                 attempt_pwd = raw[5:].strip()
@@ -908,7 +1000,7 @@ async def chat_ws(websocket: WebSocket, room: str):
 
 
 # ----------------------------------------------------------------------
-# 8️⃣ Signalling / Swarm websocket – tracks peers / progress (P2P ready)
+# 12️⃣ Signalling / Swarm websocket – tracks peers / progress (P2P ready)
 # ----------------------------------------------------------------------
 @app.websocket("/ws/signal/{room}")
 async def signal_ws(websocket: WebSocket, room: str):
@@ -962,7 +1054,7 @@ async def signal_ws(websocket: WebSocket, room: str):
 
 
 # ----------------------------------------------------------------------
-# 9️⃣ File‑list update websocket – pushes “UPDATE” when a file changes
+# 13️⃣ File‑list update websocket – pushes "UPDATE" when a file changes
 # ----------------------------------------------------------------------
 @app.websocket("/ws/{room}")
 async def update_ws(websocket: WebSocket, room: str):
@@ -970,7 +1062,7 @@ async def update_ws(websocket: WebSocket, room: str):
     update_rooms.setdefault(room, []).append(websocket)
     try:
         while True:
-            await websocket.receive_text()   # keep‑alive (no incoming msgs expected)
+            await websocket.receive_text()   # keep‑alive (no incoming messages expected)
     except WebSocketDisconnect:
         update_rooms[room].remove(websocket)
         if not update_rooms[room]:
@@ -989,7 +1081,7 @@ async def notify_update(room: str):
 
 
 # ----------------------------------------------------------------------
-# 10️⃣ Cancel upload endpoint – client can abort a multipart upload
+# 14️⃣ Cancel upload endpoint – client can abort a multipart upload
 # ----------------------------------------------------------------------
 @app.post("/cancel_upload")
 async def cancel_upload(
@@ -1008,7 +1100,7 @@ async def cancel_upload(
 
 
 # ----------------------------------------------------------------------
-# 11️⃣ Compatibility wrappers (legacy UI)
+# 15️⃣ Compatibility wrappers (legacy UI)
 # ----------------------------------------------------------------------
 @app.post("/upload")
 async def upload_compat(room: str, file: UploadFile = File(...)):
@@ -1028,32 +1120,25 @@ async def upload_compat(room: str, file: UploadFile = File(...)):
 
 @app.get("/file_info/{room}/{filename}")
 async def file_info_compat(room: str, filename: str):
+    """Legacy alias for /file_info."""
     return await file_info(room=room, filename=filename)
 
 
 @app.get("/data/{room}/{filename}")
 async def data_compat(room: str, filename: str, chunk_id: int = 0):
+    """Legacy alias for /download_chunk."""
     return await download_chunk(room=room, filename=filename, chunk_id=chunk_id)
 
 
-@app.get("/download")
-async def download_compat(room: str, filename: str):
-    return await download_full(room=room, filename=filename)
-
+# ----------------------------------------------------------------------
+# 16️⃣ Serve static UI (index.html + app.js)
+# ----------------------------------------------------------------------
+# All files in ./static/ are served at the root.
+# `html=True` makes FastAPI return `index.html` for any path that does not match an API route.
+app.mount("/", StaticFiles(directory="static", html=True), name="static")
 
 # ----------------------------------------------------------------------
-# 12️⃣ Serve the SPA (index.html)
-# ----------------------------------------------------------------------
-@app.get("/{full_path:path}", response_class=HTMLResponse)
-async def serve_root(full_path: str):
-    index_file = BASE_DIR / "index.html"
-    if index_file.is_file():
-        return FileResponse(index_file, media_type="text/html")
-    return HTMLResponse("<h1>index.html not found</h1>", status_code=404)
-
-
-# ----------------------------------------------------------------------
-# 13️⃣ Run the server (starts console REPL in a daemon thread)
+# 17️⃣ Run the server (starts console REPL in a daemon thread)
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
     import argparse
@@ -1070,11 +1155,11 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8000, help="Port to listen on (default 8000).")
     args = parser.parse_args()
 
-    # Add any drives supplied on the command line (they’ll also be persisted)
+    # Add any drives supplied on the command line (they will also be persisted)
     for p in args.drive:
         add_drive(Path(p).expanduser().resolve())
 
-    # start the REPL in a background thread
+    # start the REPL in a background daemon thread
     threading.Thread(target=console_thread, daemon=True).start()
 
     ip = get_local_ip()
