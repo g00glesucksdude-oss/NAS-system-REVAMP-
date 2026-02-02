@@ -44,11 +44,15 @@ def type_out_file(filepath):
             sys.stdout.flush()
     print("\n")
 
+import os
+
 def loading_animation():
     print(GREEN + "=== Reading server.py ===" + RESET)
     type_out_file("server.py")
-    print(GREEN + "\n=== Reading index.html ===" + RESET)
-    type_out_file("index.html")
+    print(GREEN + "\n=== Reading static/index.html ===" + RESET)
+    type_out_file(os.path.join("static", "index.html"))
+    print(GREEN + "\n=== Reading static/app.js ===" + RESET)
+    type_out_file(os.path.join("static", "app.js"))
     print("\n😂 Relax, it’s just an animation!\n")
 
 def run_server():
