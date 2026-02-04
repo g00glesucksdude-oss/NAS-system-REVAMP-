@@ -17,9 +17,9 @@ import time
 import secrets
 import hashlib
 from pathlib import Path
-from typing import Dict, List, Set
-
+from typing import Dict, List, Set, Optional
 import aiofiles
+
 from fastapi import (
     FastAPI,
     UploadFile,
@@ -32,17 +32,16 @@ from fastapi import (
 from fastapi.responses import FileResponse, StreamingResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from datetime import datetime  # <-- fixed import
+from datetime import datetime
 
 # ----------------------------------------------------------------------
 # CONFIGURATION
 # ----------------------------------------------------------------------
-CHUNK_SIZE = 4 * 1024 * 1024  # 4 MiB
+CHUNK_SIZE = 4 * 1024 * 1024  # 4 MiB
 BASE_DIR = Path(__file__).parent.resolve()
 UPLOAD_ROOT = BASE_DIR / "uploads"
 UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
 PERSIST_FILE = BASE_DIR / "persist.json"
-
 MAX_PWD_ATTEMPTS = 5
 LOCKOUT_SECONDS = 300
 MAX_LEGACY_USERS = 2  # default, can be changed from console
@@ -50,18 +49,15 @@ MAX_LEGACY_USERS = 2  # default, can be changed from console
 # ----------------------------------------------------------------------
 # GLOBAL STATE – MULTI‑ROOM
 # ----------------------------------------------------------------------
-chat_rooms: Dict[str, List[WebSocket]] = {}          # room → all chat sockets
-chat_auth: Dict[str, Set[WebSocket]] = {}           # room → authenticated sockets
+chat_rooms: Dict[str, List[WebSocket]] = {}  # room → all chat sockets
+chat_auth: Dict[str, Set[WebSocket]] = {}  # room → authenticated sockets
 signal_rooms: Dict[str, Dict[str, WebSocket]] = {}  # room → {peer_id: ws}
-update_rooms: Dict[str, List[WebSocket]] = {}       # room → update sockets
-
-uploads_state: Dict[str, dict] = {}                 # "room/filename" → upload info
-
-auth_tokens: Dict[str, dict] = {}                   # token → {"room":str, "expires":ts}
-pwd_attempts: Dict[str, Dict[str, dict]] = {}      # room → ip → {count, locked_until}
-
-DRIVE_INFO: Dict[str, dict] = {}                    # mount_name → {"path":Path,"display":str}
-ROOM_PASSWORDS: Dict[str, str] = {}                 # room → password
+update_rooms: Dict[str, List[WebSocket]] = {}  # room → update sockets
+uploads_state: Dict[str, dict] = {}  # "room/filename" → upload info
+auth_tokens: Dict[str, dict] = {}  # token → {"room":str, "expires":ts}
+pwd_attempts: Dict[str, Dict[str, dict]] = {}  # room → ip → {count, locked_until}
+DRIVE_INFO: Dict[str, dict] = {}  # mount_name → {"path":Path,"display":str}
+ROOM_PASSWORDS: Dict[str, str] = {}  # room → password
 READONLY_ROOMS: Set[str] = set()
 
 # legacy‑download throttling (ip → start‑time)
@@ -125,18 +121,14 @@ def load_state():
     try:
         with PERSIST_FILE.open("r", encoding="utf-8") as f:
             data = json.load(f)
-
         for name, info in data.get("drives", {}).items():
             path = Path(info["path"])
             if path.is_dir():
                 DRIVE_INFO[name] = {"path": path, "display": info.get("display", name)}
-
         ROOM_PASSWORDS = data.get("passwords", {})
         READONLY_ROOMS = set(data.get("readonly_rooms", []))
-
         settings = data.get("settings", {})
         MAX_LEGACY_USERS = settings.get("max_legacy_users", 2)
-
         print("[i] Persisted state loaded.")
     except Exception as exc:
         print(f"[!] Failed to load persisted state: {exc}")
@@ -159,11 +151,14 @@ def save_state():
         print(f"[!] Could not persist state: {exc}")
 
 
+# Create the app early so we can reference it
+app = FastAPI()
+
+
 def add_drive(path: Path):
     if not path.is_dir():
         print(f"[!] Drive path does not exist → {path}")
         return
-
     base_name = path.name
     mount_name = _sanitize_mount_name(base_name)
     suffix = 0
@@ -171,7 +166,6 @@ def add_drive(path: Path):
     while final_name in DRIVE_INFO:
         suffix += 1
         final_name = f"{mount_name}_{suffix}"
-
     DRIVE_INFO[final_name] = {"path": path, "display": base_name}
     app.mount(f"/{final_name}", StaticFiles(directory=path), name=final_name)
     print(f"[+] Mounted {path} as /{final_name}")
@@ -182,10 +176,20 @@ def remove_drive(name: str):
     if name not in DRIVE_INFO:
         print(f"[!] No such drive {name}")
         return
-
-    app.router.routes = [
-        r for r in app.router.routes if not (hasattr(r, "path") and r.path.startswith(f"/{name}"))
-    ]
+    # Safely remove the mount by recreating the app's route list
+    # Filter out only the exact StaticFiles mount for this drive
+    new_routes = []
+    for route in app.router.routes:
+        # Keep the route if it's not the StaticFiles mount for this drive
+        if (
+            hasattr(route, "path")
+            and route.path == f"/{name}"
+            and hasattr(route, "name")
+            and route.name == name
+        ):
+            continue  # Skip this route (remove it)
+        new_routes.append(route)
+    app.router.routes = new_routes
     DRIVE_INFO.pop(name)
     print(f"[-] Unmounted drive {name}")
     save_state()
@@ -196,37 +200,32 @@ def remove_drive(name: str):
 # ----------------------------------------------------------------------
 def console_thread():
     global MAX_LEGACY_USERS
-
     help_msg = """
 Commands:
-  adddrive <path>          - mount external folder
-  rmdrive <name>           - unmount drive
-  listdrives              - show mounted drives
-  setpwd <room> <pwd>     - protect room with password
-  rempwd <room>           - remove password
-  setreadonly <room>      - mark room read‑only
-  unsetreadonly <room>    - remove read‑only flag
-  setlegacylimit <N>      - set max legacy downloads
-  reload                  - reload persist.json
-  exit / quit             - stop server
+  adddrive <path>      - mount external folder
+  rmdrive <name>       - unmount drive
+  listdrives           - show mounted drives
+  setpwd <room> <pwd>  - protect room with password
+  rempwd <room>        - remove password
+  setreadonly <room>   - mark room read‑only
+  unsetreadonly <room> - remove read‑only flag
+  setlegacylimit <n>   - set max legacy downloads
+  reload               - reload persist.json
+  exit / quit          - stop server
 """
     print(help_msg)
-
     while True:
         try:
             raw = input("> ")
         except (EOFError, KeyboardInterrupt):
             break
-
         try:
             parts = shlex.split(raw)
         except ValueError as e:
             print(f"[!] Parsing error: {e}")
             continue
-
         if not parts:
             continue
-
         cmd = parts[0].lower()
 
         if cmd == "adddrive" and len(parts) >= 2:
@@ -296,10 +295,8 @@ Commands:
 
 
 # ----------------------------------------------------------------------
-# FASTAPI APP
+# FASTAPI APP SETUP
 # ----------------------------------------------------------------------
-app = FastAPI()
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -321,6 +318,7 @@ env_drives = [
 for p in env_drives:
     add_drive(p)
 
+
 # ----------------------------------------------------------------------
 # AUTH HELPERS
 # ----------------------------------------------------------------------
@@ -340,14 +338,12 @@ def _track_attempt(room: str, client_ip: str, success: bool):
             attempts["locked_until"] = now + LOCKOUT_SECONDS
 
 
-def check_password(room: str, pwd: str | None, client_ip: str):
+def check_password(room: str, pwd: Optional[str], client_ip: str):
     passwords = _current_passwords()
     required = passwords.get(room)
-
     if required is None:
         _track_attempt(room, client_ip, True)
         return
-
     attempts = pwd_attempts.setdefault(room, {}).setdefault(
         client_ip, {"count": 0, "locked_until": 0}
     )
@@ -360,11 +356,10 @@ def check_password(room: str, pwd: str | None, client_ip: str):
     if pwd != required:
         _track_attempt(room, client_ip, False)
         raise HTTPException(status_code=403, detail="Invalid room password")
-
     _track_attempt(room, client_ip, True)
 
 
-def verify_room(room: str, pwd: str | None, client_ip: str | None):
+def verify_room(room: str, pwd: Optional[str], client_ip: Optional[str]):
     passwords = _current_passwords()
     if room in passwords:
         if client_ip is None:
@@ -376,9 +371,9 @@ def verify_room(room: str, pwd: str | None, client_ip: str | None):
 
 def auth_or_pwd(
     room: str,
-    pwd: str | None = None,
-    auth_token: str | None = None,
-    request: Request | None = None,
+    pwd: Optional[str] = None,
+    auth_token: Optional[str] = None,
+    request: Optional[Request] = None,
 ):
     if auth_token:
         info = auth_tokens.get(auth_token)
@@ -388,7 +383,6 @@ def auth_or_pwd(
             auth_tokens.pop(auth_token, None)
             raise HTTPException(status_code=403, detail="Auth token expired")
         return
-
     client_ip = request.client.host if request else None
     verify_room(room, pwd, client_ip)
 
@@ -435,16 +429,14 @@ async def upload_chunk(
     chunk_index: int,
     total_chunks: int,
     file: UploadFile = File(...),
-    checksum: str | None = None,
-    pwd: str | None = None,
-    auth_token: str | None = None,
+    checksum: Optional[str] = None,
+    pwd: Optional[str] = None,
+    auth_token: Optional[str] = None,
     request: Request = None,
 ):
     auth_or_pwd(room, pwd, auth_token, request)
-
     if room in READONLY_ROOMS:
         raise HTTPException(status_code=403, detail="Room is read‑only")
-
     if not (0 <= chunk_index < total_chunks):
         raise HTTPException(status_code=400, detail="Invalid chunk_index")
 
@@ -473,7 +465,6 @@ async def upload_chunk(
             "hashes": [None] * total_chunks,
         }
         uploads_state[key] = state
-
     state["received"].add(chunk_index)
     state["hashes"][chunk_index] = sha256_bytes(data)
 
@@ -504,7 +495,6 @@ async def upload_chunk(
         # clean up temp folder and state
         shutil.rmtree(tmp_dir, ignore_errors=True)
         uploads_state.pop(key, None)
-
         await notify_update(room)
 
     return {"status": "ok", "chunk_index": chunk_index}
@@ -517,12 +507,11 @@ async def upload_chunk(
 async def file_info(
     room: str,
     filename: str,
-    pwd: str | None = None,
-    auth_token: str | None = None,
+    pwd: Optional[str] = None,
+    auth_token: Optional[str] = None,
     request: Request = None,
 ):
     auth_or_pwd(room, pwd, auth_token, request)
-
     file_path = UPLOAD_ROOT / room / os.path.basename(filename)
     if not file_path.is_file():
         raise HTTPException(status_code=404, detail="File not found")
@@ -552,12 +541,11 @@ async def download_chunk(
     room: str,
     filename: str,
     chunk_id: int,
-    pwd: str | None = None,
-    auth_token: str | None = None,
+    pwd: Optional[str] = None,
+    auth_token: Optional[str] = None,
     request: Request = None,
 ):
     auth_or_pwd(room, pwd, auth_token, request)
-
     file_path = UPLOAD_ROOT / room / os.path.basename(filename)
     if not file_path.is_file():
         raise HTTPException(status_code=404, detail="File not found")
@@ -587,8 +575,8 @@ async def download_chunk(
 async def download_full(
     room: str,
     filename: str,
-    pwd: str | None = None,
-    auth_token: str | None = None,
+    pwd: Optional[str] = None,
+    auth_token: Optional[str] = None,
     request: Request = None,
 ):
     auth_or_pwd(room, pwd, auth_token, request)
@@ -604,16 +592,14 @@ async def download_full(
 @app.get("/list")
 async def list_files(
     room: str,
-    pwd: str | None = None,
-    auth_token: str | None = None,
+    pwd: Optional[str] = None,
+    auth_token: Optional[str] = None,
     request: Request = None,
 ):
     auth_or_pwd(room, pwd, auth_token, request)
-
     room_path = UPLOAD_ROOT / room
     if not room_path.is_dir():
         return {"files": [], "room": room}
-
     return {
         "files": [
             {"name": p.name, "size": p.stat().st_size}
@@ -628,15 +614,13 @@ async def list_files(
 async def delete_file(
     room: str,
     filename: str,
-    pwd: str | None = None,
-    auth_token: str | None = None,
+    pwd: Optional[str] = None,
+    auth_token: Optional[str] = None,
     request: Request = None,
 ):
     auth_or_pwd(room, pwd, auth_token, request)
-
     if room in READONLY_ROOMS:
         raise HTTPException(status_code=403, detail="Room is read‑only")
-
     file_path = UPLOAD_ROOT / room / os.path.basename(filename)
     if not file_path.is_file():
         raise HTTPException(status_code=404, detail="File not found")
@@ -645,7 +629,6 @@ async def delete_file(
     file_path.unlink()
     if meta_file.is_file():
         meta_file.unlink()
-
     await notify_update(room)
     return {"status": "deleted"}
 
@@ -654,17 +637,15 @@ async def delete_file(
 async def cancel_upload(
     room: str,
     filename: str,
-    pwd: str | None = None,
-    auth_token: str | None = None,
+    pwd: Optional[str] = None,
+    auth_token: Optional[str] = None,
     request: Request = None,
 ):
     auth_or_pwd(room, pwd, auth_token, request)
-
     filename = os.path.basename(filename)
     tmp_dir = UPLOAD_ROOT / room / f"{filename}.tmp"
     if tmp_dir.is_dir():
         shutil.rmtree(tmp_dir, ignore_errors=True)
-
     uploads_state.pop(f"{room}/{filename}", None)
     return {"status": "canceled"}
 
@@ -688,7 +669,7 @@ async def list_drives():
 
 
 @app.get("/streams/file_info")
-async def streams_file_info(path: str, drive: str = None):
+async def streams_file_info(path: str, drive: Optional[str] = None):
     if not DRIVE_INFO:
         raise HTTPException(status_code=404, detail="No drives mounted")
     if drive is None:
@@ -752,7 +733,7 @@ async def streams_browse(drive: str, dir_path: str = ""):
 
 
 @app.get("/streams/data")
-async def streams_data(path: str, drive: str = None, chunk_id: int = None):
+async def streams_data(path: str, drive: Optional[str] = None, chunk_id: Optional[int] = None):
     if not DRIVE_INFO:
         raise HTTPException(status_code=404, detail="No drives mounted")
     if drive is None:
@@ -789,7 +770,7 @@ async def streams_data(path: str, drive: str = None, chunk_id: int = None):
 
 
 @app.get("/streams/data_legacy")
-async def streams_data_legacy(path: str, drive: str = None, request: Request = None):
+async def streams_data_legacy(path: str, drive: Optional[str] = None, request: Request = None):
     if not DRIVE_INFO:
         raise HTTPException(status_code=404, detail="No drives mounted")
     if drive is None:
@@ -864,11 +845,12 @@ async def chat_ws(websocket: WebSocket, room: str):
     else:
         passwords = _current_passwords()
         password_required = room in passwords
-        if not password_required:
-            chat_auth[room].add(websocket)
-            await websocket.send_text("SYSTEM: No password required.")
-        else:
-            await websocket.send_text("SYSTEM: Type pass:YOUR_PASSWORD to authenticate.")
+
+    if not password_required:
+        chat_auth[room].add(websocket)
+        await websocket.send_text("SYSTEM: No password required.")
+    else:
+        await websocket.send_text("SYSTEM: Type pass:YOUR_PASSWORD to authenticate.")
 
     try:
         while True:
@@ -914,7 +896,6 @@ async def chat_ws(websocket: WebSocket, room: str):
             chat_rooms[room].remove(websocket)
         if room in chat_auth:
             chat_auth[room].discard(websocket)
-
         if room in chat_rooms and not chat_rooms[room]:
             del chat_rooms[room]
         if room in chat_auth and not chat_auth[room]:
@@ -935,8 +916,7 @@ async def signal_ws(websocket: WebSocket, room: str):
         await websocket.close(code=1008)
         return
 
-    peer_id: str | None = None
-
+    peer_id: Optional[str] = None
     try:
         while True:
             raw = await websocket.receive_text()
@@ -945,10 +925,8 @@ async def signal_ws(websocket: WebSocket, room: str):
             if msg.get("type") == "join":
                 peer_id = msg["id"]
                 signal_rooms.setdefault(room, {})[peer_id] = websocket
-
                 others = [pid for pid in signal_rooms[room] if pid != peer_id]
                 await websocket.send_json({"type": "peer_list", "peers": others})
-
                 # notify other peers in the same room
                 for pid, ws in signal_rooms[room].items():
                     if pid != peer_id:
@@ -983,7 +961,6 @@ async def update_ws(websocket: WebSocket, room: str):
     """
     await websocket.accept()
     update_rooms.setdefault(room, []).append(websocket)
-
     try:
         while True:
             await websocket.receive_text()
@@ -995,7 +972,7 @@ async def update_ws(websocket: WebSocket, room: str):
 
 
 async def notify_update(room: str):
-    """Push an “UPDATE” message to all sockets subscribed to the given room."""
+    """Push an "UPDATE" message to all sockets subscribed to the given room."""
     if room not in update_rooms:
         return
     for ws in update_rooms[room][:]:
@@ -1044,12 +1021,11 @@ async def root_spa():
 async def serve_room(room_name: str):
     """
     Any unknown top‑level path (that is not a static asset or a drive mount)
-    is treated as a “room” and receives the SPA.
+    is treated as a "room" and receives the SPA.
     """
     # ignore static assets that live under /static
     if room_name.startswith("static"):
         raise HTTPException(status_code=404)
-
     # ignore drive mounts
     if room_name in DRIVE_INFO:
         raise HTTPException(status_code=404)
